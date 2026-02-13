@@ -1,0 +1,64 @@
+Quiero fabricar un proyecto con un esp32 y varios componentes electrónicos.
+
+*Componentes electrónicos:
+	-Vamos a emplear un esp32-32d n4 con conector de usbc para su alimentacion.
+	-Un buffer con tres pines (en el buffer pone una "s" y "-" y el del medio).
+	-Un display con pines (gnd, vdd, sck, sda), 
+	-Un interruptor para encender el dispositivo (rocket switch v1.0 con pines gnd, vcc ,sig)
+	-Un touch (hw 139 con pines sig,vcc,gnd)
+
+*Conexiones de los elementos:
+(todos lso pines gnd y 3v3 van conectados en la misma fila del protoboard para poder compartir puerto)
+
+Display (GND VDD SDA SCK)
+	GND - GND ESP32
+	VDD - 3V3 ESP32
+	SDA - GPIO 21
+	SCK - GPIO 22
+
+Rocket Switch(GND VCC SIG)
+	GND - GND ESP32
+	VCC - 3V3 ESP32
+	SIG - GPIO 23
+
+HW-139 Touch (GND VCC SIG)
+	GND - GND ESP32
+	VCC - 3V3 ESP32
+	SIG - GPIO 32
+
+Zumbador 3-pines (+ - S)
+	+ - 3V3 ESP32
+	- - GND ESP32
+	S - GPIO 25
+
+*Para realizarlo,voy a emplear platform.io en vs code con el bloque init:
+[env:esp32dev]
+platform = espressif32
+board = esp32dev
+framework = arduino
+monitor_speed = 115200
+
+*Programación del proyecto:
+El esp32 recibe la corriente de alimentación.
+Variable del touch inicializada a false.
+Variable del switch inicializada a false (off).
+
+Bucle para comprobar el estado de la variable del switch.
+Dentro del bucle:
+	Si el switch está en false/off, no pasa nada.
+
+	Si el switch está en true/on, en el display se muestre "Pulse para activar".
+	Si el touch es pulsado 1 vez, empieza:
+		Bucle que va de 10 al 0:
+			-muestra en el display el valor del conteo.
+			-entra en el bucle que observe la variable de touch.
+
+	Si la variable del switch sigue a true y el conteo llega a 0:
+		-suena el buffer/zumbador durante 3 segundos y se para el sistema.
+		-muestra en el display "Resetear?"
+		si el touch vuelve a ser pulsado, la cuenta vuelve a reiniciarse, si el swich se pone a off, muestra "Apagando"...
+
+	Si se pulsa el touch durante la cuenta atrás (variable del touch a true), esta se bloquea el conteo y muestra en el display la frase "stop" durante 3 segundos.
+
+Para volver a activar el sistema, abría que darle al switch para ponerlo a false.
+
