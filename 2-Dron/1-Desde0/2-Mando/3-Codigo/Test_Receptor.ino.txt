@@ -1,0 +1,80 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+#define LED_PIN 8
+
+typedef struct {
+  int joy1_x;
+  int joy1_y;
+  int joy2_x;
+  int joy2_y;
+  bool btn1;
+  bool btn2;
+} ControlData;
+
+ControlData data;
+
+bool buttonPressed = false;
+unsigned long lastBlink = 0;
+int blinkInterval = 500;
+bool ledState = false;
+
+void onDataReceived(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  memcpy(&data, incomingData, sizeof(data));
+
+    if ((data.joy1_x<100)||(data.joy1_x>4000)||(data.joy1_y<100)||(data.joy1_y>4000)||(data.joy2_x<100)||(data.joy2_x>4000)||(data.joy2_y<100)||(data.joy2_y>4000))
+    {
+      blinkInterval =50;
+    }
+    else
+    {
+      blinkInterval=500;
+    }
+
+  Serial.println("Datos recibidos:");
+  Serial.print("Joystick izquierdo X: "); Serial.println(data.joy1_x);
+  Serial.print("Joystick izquierdo Y: "); Serial.println(data.joy1_y);
+  Serial.print("Joystick derecho X: ");  Serial.println(data.joy2_x);
+  Serial.print("Joystick derecho Y: ");  Serial.println(data.joy2_y);
+  Serial.print("BotÃ³n izquierdo: ");     Serial.println(data.btn1 ? "PULSADO" : "NO");
+  Serial.print("BotÃ³n derecho: ");       Serial.println(data.btn2 ? "PULSADO" : "NO");
+  Serial.println("-------------");
+
+  buttonPressed = data.btn1 || data.btn2;
+
+  if (buttonPressed) {
+    digitalWrite(LED_PIN, LOW);
+  } 
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (true);
+  }
+
+  esp_now_register_recv_cb(onDataReceived);
+
+  delay(1000);
+
+  Serial.print("MAC del receptor (ESP32-C3): ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+
+  if (millis() - lastBlink >= blinkInterval) {
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+    lastBlink = millis();
+  }
+
+}
+

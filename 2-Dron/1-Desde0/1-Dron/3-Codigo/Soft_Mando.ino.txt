@@ -1,0 +1,111 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+//Estructura recepciÃ³n
+typedef struct {
+  float roll_f, pitch_f;
+  int motorBase;
+  int out1, out2, out3, out4;
+  float manPitchCmd;
+  float manRollCmd;
+  float manYawCmd;
+  float yaw_f;
+  float gyroZ_corr;
+  uint16_t distance_mm;
+} TelemetryData;
+
+TelemetryData telemetry;
+
+void onTelemetryReceived(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len == sizeof(TelemetryData)) {
+    memcpy(&telemetry, data, len);
+    Serial.printf("Base:%3d | m1:%3d  m2:%3d  m3:%3d  m4:%3d | pitch:%5.1f  roll:%5.1f  yaw:%5.1f  gyro:%5.1f | Manpitch:%5.1f Manroll:%5.1f Manyaw:%5.1f | dist=%3d mm\n",
+                 telemetry.motorBase, telemetry.out1, telemetry.out2, telemetry.out3, telemetry.out4, telemetry.pitch_f, telemetry.roll_f, 
+                 telemetry.yaw_f, telemetry.gyroZ_corr, telemetry.manPitchCmd, telemetry.manRollCmd, telemetry.manYawCmd, telemetry.distance_mm);
+  }
+}
+
+// Estructura que se enviarÃ¡
+typedef struct {
+  int joy1_x;
+  int joy1_y;
+  int joy2_x;
+  int joy2_y;
+  bool btn1;
+  bool btn2;
+} ControlData;
+
+ControlData data;
+
+// DirecciÃ³n MAC del receptor (cambiar por la mac del receptor/Dron)
+uint8_t receiverAddress[] = {0x10, 0xB4, 0x1D, 0x4F, 0x81, 0xB8};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Pines joystick izquierdo
+  pinMode(2, INPUT);   // VRx izquierda
+  pinMode(3, INPUT);   // VRy izquierda
+  pinMode(21, INPUT_PULLUP);  // BotÃ³n izquierdo
+
+  // Pines joystick derecho
+  pinMode(1, INPUT);   // VRx derecha
+  pinMode(0, INPUT);   // VRy derecha
+  pinMode(20, INPUT_PULLUP);  // BotÃ³n derecho
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    //while (true);
+    return;
+  }
+
+  esp_now_register_recv_cb(onTelemetryReceived);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Error aÃ±adiendo peer");
+    return;
+  }
+
+  Serial.println(WiFi.macAddress());
+  delay(1000);
+}
+
+void loop() {
+  int joyLeftX = analogRead(2);
+  int joyLeftY = analogRead(3);
+  int joyRightX = analogRead(1);
+  int joyRightY = analogRead(0);
+  
+  bool buttonLeft = digitalRead(21) == LOW;
+  bool buttonRight = digitalRead(20) == LOW;
+
+  // Muestra valores en el monitor serie
+  /*
+  Serial.print("Izq X: "); Serial.print(joyLeftX);
+  Serial.print("\tIzq Y: "); Serial.print(joyLeftY);
+  Serial.print("\tDer X: "); Serial.print(joyRightX);
+  Serial.print("\tDer Y: "); Serial.print(joyRightY);
+  Serial.print("\tBtnIzq: "); Serial.print(buttonLeft);
+  Serial.print("\tBtnDer: "); Serial.println(buttonRight);
+  */
+
+  data.joy1_x = analogRead(2);
+  data.joy1_y = analogRead(3);
+  data.joy2_x = analogRead(1);
+  data.joy2_y = analogRead(0);
+  data.btn1 = digitalRead(21) == LOW;
+  data.btn2 = digitalRead(20) == LOW;
+
+  esp_now_send(receiverAddress, (uint8_t *)&data, sizeof(data));
+
+  delay(50);
+}
+

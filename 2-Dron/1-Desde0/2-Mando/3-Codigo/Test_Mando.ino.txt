@@ -1,0 +1,80 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// Estructura que se enviarÃ¡
+typedef struct {
+  int joy1_x;
+  int joy1_y;
+  int joy2_x;
+  int joy2_y;
+  bool btn1;
+  bool btn2;
+} ControlData;
+
+ControlData data;
+
+// DirecciÃ³n MAC del receptor (cambiar por la mac del receptor)
+uint8_t receiverAddress[] = {0x98, 0x3D, 0xAE, 0xB6, 0x05, 0xE4};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Pines joystick izquierdo
+  pinMode(2, INPUT);   // VRx izquierda
+  pinMode(3, INPUT);   // VRy izquierda
+  pinMode(21, INPUT_PULLUP);  // BotÃ³n izquierdo
+
+  // Pines joystick derecho
+  pinMode(1, INPUT);   // VRx derecha
+  pinMode(0, INPUT);   // VRy derecha
+  pinMode(20, INPUT_PULLUP);  // BotÃ³n derecho
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    //while (true);
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Error aÃ±adiendo peer");
+    return;
+  }
+}
+
+void loop() {
+  int joyLeftX = analogRead(2);
+  int joyLeftY = analogRead(3);
+  int joyRightX = analogRead(1);
+  int joyRightY = analogRead(0);
+  
+  bool buttonLeft = digitalRead(21) == LOW;
+  bool buttonRight = digitalRead(20) == LOW;
+
+  // Muestra valores en el monitor serie
+  Serial.print("Izq X: "); Serial.print(joyLeftX);
+  Serial.print("\tIzq Y: "); Serial.print(joyLeftY);
+  Serial.print("\tDer X: "); Serial.print(joyRightX);
+  Serial.print("\tDer Y: "); Serial.print(joyRightY);
+  Serial.print("\tBtnIzq: "); Serial.print(buttonLeft);
+  Serial.print("\tBtnDer: "); Serial.println(buttonRight);
+
+  data.joy1_x = analogRead(2);
+  data.joy1_y = analogRead(3);
+  data.joy2_x = analogRead(1);
+  data.joy2_y = analogRead(0);
+  data.btn1 = digitalRead(21) == LOW;
+  data.btn2 = digitalRead(20) == LOW;
+
+  esp_now_send(receiverAddress, (uint8_t *)&data, sizeof(data));
+
+  delay(50);
+}
+

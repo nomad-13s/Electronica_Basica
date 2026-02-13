@@ -1,0 +1,481 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "driver/ledc.h"  
+#include <Adafruit_VL53L0X.h>
+
+// =================== CONFIGURACIÃ“N ===================
+const int PWM_FREQ = 8000;             // 8 kHz para brushed
+const ledc_timer_bit_t PWM_RES = LEDC_TIMER_8_BIT; // 0..255
+const int PWM_MAX = 255;
+
+// Motores (pines)
+const int PIN_M1 = 21;  // delantero izq
+const int PIN_M2 = 9;   // delantero der
+const int PIN_M3 = 4;   // trasero der
+const int PIN_M4 = 1;   // trasero izq
+
+// Canales LEDC
+const ledc_channel_t CH_M1 = LEDC_CHANNEL_0;
+const ledc_channel_t CH_M2 = LEDC_CHANNEL_1;
+const ledc_channel_t CH_M3 = LEDC_CHANNEL_2;
+const ledc_channel_t CH_M4 = LEDC_CHANNEL_3;
+
+// Timer LEDC
+const ledc_timer_t    LEDC_TIMER = LEDC_TIMER_0;
+const ledc_mode_t     LEDC_MODE  = LEDC_LOW_SPEED_MODE;
+
+// Control / mezcla
+int   MOTOR_IDLE = 150;   // Potencia principal
+const int HEADROOM   = 40; // margen sup. para no pegar en 255
+
+
+float Kp_pitch = 3.0f;
+float Kd_pitch = 0.5f;
+float Kp_roll  = 3.0f;
+float Kd_roll  = 0.5f;
+float Kp_yaw   = 0.5f;   // yaw â€œrate holdâ€ (sobre gyroZ)
+
+
+//Anular PD
+/*
+float Kp_pitch = 0.0f;
+float Kd_pitch = 0.0f;
+float Kp_roll  = 0.0f;
+float Kd_roll  = 0.0f;
+float Kp_yaw   = 0.0f;   // yaw â€œrate holdâ€ (sobre gyroZ)
+*/
+
+
+float manualPitchCmd = 0;
+float manualRollCmd  = 0;
+float manualYawCmd   = 0;
+
+// Filtro complementario (99% gyro, 1% accel)
+const float ALPHA = 0.99f;
+
+// OrientaciÃ³n del MPU (ajusta si reacciona al revÃ©s)
+const int ROLL_SIGN  = +1;
+const int PITCH_SIGN = +1;
+
+// I2C
+#define I2C_SDA 7
+#define I2C_SCL 6
+
+Adafruit_MPU6050 mpu;
+Adafruit_VL53L0X lox;
+
+uint16_t dist_mm = 0xFFFF;
+bool Aterrizar=false;
+
+//TelemetrÃ­a hacia el mando. Poner mac del mando
+uint8_t broadcastAddress[] = {0xD8, 0x3B, 0xDA, 0xE3, 0xFE, 0x28};
+
+typedef struct {
+  float roll_f, pitch_f;
+  int motorBase;
+  int out1, out2, out3, out4;
+  float manPitchCmd;
+  float manRollCmd;
+  float manYawCmd;
+  float yaw_f;
+  float gyroZ_corr;
+  uint16_t distance_mm;
+} TelemetryData;
+
+TelemetryData telemetry;
+
+// =================== MANDO (ESP-NOW) ===================
+typedef struct {
+  int joy1_x;  // 0..4095
+  int joy1_y;
+  int joy2_x;
+  int joy2_y;
+  bool btn1;   // desarmar
+  bool btn2;   // armar
+} ControlData;
+
+ControlData data;
+bool  ActivarMotor = false;
+int   baseCmd = 0; // 0..(PWM_MAX - MOTOR_IDLE - HEADROOM)
+
+// =================== ESTADO ===================
+float roll_f = 0, pitch_f = 0, yaw_f = 0;   // Ã¡ngulos filtrados
+float gyroZ_corr=0; //AceleraciÃ³n eje Z. MediciÃ³n de giro.
+unsigned long lastTime = 0;
+
+float alt_target = 300.0f; // altura deseada (mm)
+
+// =================== UTILES PWM ===================
+static inline void setMotor(ledc_channel_t ch, int duty) {
+  duty = constrain(duty, 0, PWM_MAX);
+  ledc_set_duty(LEDC_MODE, ch, duty);
+  ledc_update_duty(LEDC_MODE, ch);
+}
+
+static void setupPWM() {
+  // Timer
+  ledc_timer_config_t timer = {};
+  timer.speed_mode      = LEDC_MODE;
+  timer.timer_num       = LEDC_TIMER;
+  timer.duty_resolution = PWM_RES;
+  timer.freq_hz         = PWM_FREQ;
+  timer.clk_cfg         = LEDC_AUTO_CLK;
+  ledc_timer_config(&timer);
+
+  // Helper para configurar un canal
+  auto attachChannel = [](int pin, ledc_channel_t ch) {
+    ledc_channel_config_t c = {};
+    c.gpio_num   = (gpio_num_t)pin;
+    c.speed_mode = LEDC_MODE;
+    c.channel    = ch;
+    c.intr_type  = LEDC_INTR_DISABLE;
+    c.timer_sel  = LEDC_TIMER;
+    c.duty       = 0;
+    c.hpoint     = 0;
+    ledc_channel_config(&c);
+  };
+
+  attachChannel(PIN_M1, CH_M1);
+  attachChannel(PIN_M2, CH_M2);
+  attachChannel(PIN_M3, CH_M3);
+  attachChannel(PIN_M4, CH_M4);
+}
+
+// =================== ESP-NOW ===================
+void onDataReceived(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len < (int)sizeof(ControlData)) return;
+  memcpy(&data, incomingData, sizeof(data));
+
+  // Throttle: centro = 0, sÃ³lo parte positiva, con zona muerta
+  int joyX = data.joy1_x - 2048;
+  if (abs(joyX) < 100) joyX = 0;
+
+  if ((joyX > 0) && (dist_mm < 300)){
+    int rawThrottle = map(joyX, 0, 2047, 0, 255);
+    baseCmd = map(rawThrottle, 150, 255, 0, PWM_MAX - MOTOR_IDLE - HEADROOM);
+  } else {
+    baseCmd = 0;
+  }
+  baseCmd = constrain(baseCmd, 0, PWM_MAX - MOTOR_IDLE - HEADROOM);
+  
+  if (joyX<0)
+  {
+    Aterrizar=true;
+  }
+  
+  if (data.btn1) ActivarMotor = false; // desarmar
+  if (data.btn2) 
+  {
+    ActivarMotor = true;  // armar
+    roll_f = 0.0;
+    pitch_f = 0.0;
+    yaw_f = 0.0;
+    MOTOR_IDLE = 150;
+    Aterrizar=false;
+    
+  }
+  
+  // ---- Entrada manual pitch/roll/yaw (en grados y Â°/s) ----
+  int joyY2 = data.joy2_y - 2048; // izquierda/derecha â†’ ROLL
+  int joyX2 = data.joy2_x - 2048; // adelante/atrÃ¡s   â†’ PITCH
+  int joyY1 = data.joy1_y - 2048; // yaw
+
+  if (abs(joyY2) < 400) joyY2 = 0;
+  if (abs(joyX2) < 400) joyX2 = 0;
+  if (abs(joyY1) < 400) joyY1 = 0;
+
+  
+  manualPitchCmd = map(joyX2, -2048, 2047, 10,  -10);  // grados
+  manualRollCmd  = map(joyY2, -2048, 2047, 10,  -10);  // grados
+  manualYawCmd   = map(joyY1, -2048, 2047, 20,  -20);  // Â°/s (rate)
+  
+
+}
+
+// =================== SETUP ===================
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);  // modo rÃ¡pido (400 kHz)
+
+  if (!mpu.begin(0x68)) {
+    Serial.println("MPU6050 no detectado!");
+    while (1) {}
+  }
+  
+ if (!lox.begin(0x29, &Wire)) {
+    Serial.println("VL53L0X FAIL");
+    while (1) { delay(10); }
+  }
+  lox.setMeasurementTimingBudgetMicroSeconds(20000);  // 20 ms por mediciÃ³n (~50 Hz mÃ¡x)
+
+  // PWM
+  setupPWM();
+
+  // Radio
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_max_tx_power(20);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (1) {}
+  }
+  esp_now_register_recv_cb(onDataReceived);
+
+  //Para enviar al mando
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("âŒ Error aÃ±adiendo peer del mando");
+  } else {
+    Serial.println("âœ… Peer del mando aÃ±adido correctamente");
+  }
+/////////////////////////////////////
+
+  Serial.println("Inicio OK");
+  Serial.println(WiFi.macAddress());
+
+  lastTime = micros();
+}
+
+// =================== LOOP ===================
+void loop() {
+
+ static unsigned long lastVL = 0;
+
+  if (millis() - lastVL > 100) {  // mide cada 100 ms (~40 Hz)
+    VL53L0X_RangingMeasurementData_t m;
+    lox.rangingTest(&m, false);
+
+    if (m.RangeStatus != 4) {
+      dist_mm = m.RangeMilliMeter;  //Distancia hacia el suelo
+    } else {
+      dist_mm = 0xFFFF;  // fuera de rango
+    }
+
+    lastVL = millis();
+  }
+ 
+
+  // --- IMU ---
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  // Ãngulos por acelerÃ³metro
+  float accRoll  = atan2(ay, az) * 180.0f / PI;
+  float accPitch = atan2(-ax, sqrtf(ay*ay + az*az)) * 180.0f / PI;
+
+  //Cero. En posiciÃ³n de reposo ajustar hasta que el Ã¡ngulo en ambos ejes de cero o prÃ¡cticamente cero.
+  accPitch -=0.5;
+  accRoll  +=1.9;
+  
+  // dt
+  unsigned long now = micros();
+  float dt = (now - lastTime) / 1000000.0f;
+  if (dt <= 0) dt = 0.001f;
+  lastTime = now;
+
+  // Velocidades gyro (deg/s)
+  float gyroX = g.gyro.x * 180.0f / PI; // roll rate
+  float gyroY = g.gyro.y * 180.0f / PI; // pitch rate
+  float gyroZ = g.gyro.z * 180.0f / PI;
+
+  
+  float a_total = sqrt(ax*ax + ay*ay + az*az);
+  bool acc_ok = (a_total > 7.0 && a_total < 12.0) &&
+              (abs(accRoll) < 30.0 && abs(accPitch) < 30.0);
+
+  if (acc_ok) {
+    roll_f  = ALPHA * (roll_f  + (ROLL_SIGN  * gyroX) * dt) + (1 - ALPHA) * (ROLL_SIGN  * accRoll);
+    pitch_f = ALPHA * (pitch_f + (PITCH_SIGN * gyroY) * dt) + (1 - ALPHA) * (PITCH_SIGN * accPitch);
+  } else {
+    roll_f  += (ROLL_SIGN  * gyroX) * dt;
+    pitch_f += (PITCH_SIGN * gyroY) * dt;
+  }
+
+  //Una vez que activamos el control, ajustamos desde aquÃ­ las variables
+  float roll_trim = 3.0;
+  float pitch_trim = -3.0;
+  float gyro_bias_z = -1.11f;
+  
+  //Ajuste del giro sobre sÃ­ mismo. Si queremos trabajar por Ã¡ngulo, utilizaremos yaw_f. Si solamente nos interesa el giro, utilizamos gyroZ_corr.
+  gyroZ_corr = gyroZ - gyro_bias_z;
+  yaw_f += gyroZ_corr * dt;
+  if (yaw_f > 180) yaw_f -= 360;
+  if (yaw_f < -180) yaw_f += 360;
+
+  float roll_corr  = (roll_f - manualRollCmd - roll_trim)  * Kp_roll  + (ROLL_SIGN  * gyroX) * Kd_roll;
+  float pitch_corr = (pitch_f - manualPitchCmd - pitch_trim) * Kp_pitch + (PITCH_SIGN * gyroY) * Kd_pitch;
+  float yaw_corr   = (manualYawCmd-gyroZ_corr) * Kp_yaw;
+  
+  static bool airborne = false;  // indica si ya despegÃ³
+
+  if (ActivarMotor) {
+    if (!airborne && dist_mm > 60 && dist_mm < 4000) {
+      airborne = true;  // acaba de despegar
+      Serial.println("ðŸš€ Dron en el aire");
+    }
+  }
+  // ===== CONTROL DE ALTURA =====
+  static uint16_t last_dist = 0;
+  static unsigned long last_h_time = 0;
+  float v_z = 0;             // velocidad vertical (mm/s)
+
+  float Kp_alt = 0.05f;      // ganancia proporcional de altura
+  float Kd_alt = 20.0f;       // Derivada. Freno antes del setpoint
+  float max_correction = 50; // lÃ­mite de correcciÃ³n
+
+  unsigned long now_h = millis();
+  float dt_h = (now_h - last_h_time) / 1000.0f;
+
+  if (dt_h > 0 && dist_mm != 0xFFFF && last_dist != 0xFFFF) {
+    v_z = (dist_mm - last_dist) / dt_h;  // derivada simple
+  }
+
+  last_dist = dist_mm;
+  last_h_time = now_h;
+
+  if (airborne) {
+    float error_alt = alt_target - dist_mm;
+    float correction = (error_alt * Kp_alt) - (v_z * Kd_alt);
+    correction = constrain(correction, -max_correction, max_correction);
+
+    MOTOR_IDLE = 150 + correction;
+  
+    if (dist_mm>500)
+    {
+      alt_target = 500.0f;
+    }
+  
+    // LÃ­mite de seguridad
+    MOTOR_IDLE = constrain(MOTOR_IDLE, 130, 180);
+    //Si me paso 600mm del target, aterrizo.
+    if ((dist_mm-alt_target)>600)
+    {
+     Aterrizar=true;
+    }
+  
+    // Descomentar si se utiliza
+    //Serial.printf("dist=%u mm | v_z=%.1f mm/s | err=%.1f | corr=%.1f | idle=%.1f\n",
+    //             dist_mm, v_z, error_alt, correction, MOTOR_IDLE);
+  }
+  
+  if (Aterrizar==true)
+  {
+    // Aterrizaje automÃ¡tico si se acerca mucho al suelo
+    if (dist_mm < 60 && dist_mm != 0xFFFF) {
+      ActivarMotor = false;
+      airborne = false;
+      Serial.println("ðŸ›¬ Aterrizaje automÃ¡tico");
+    }
+    else
+    {
+      MOTOR_IDLE = 80;
+    }
+  }
+  
+  // --- Base throttle ---
+  int motorBase = 0;
+  int minClamp  = 0;
+  if (ActivarMotor) {
+    minClamp  = MOTOR_IDLE;
+    motorBase = MOTOR_IDLE + baseCmd;
+    motorBase = constrain(motorBase, MOTOR_IDLE, PWM_MAX - HEADROOM);
+  }
+  
+  //Anular control y calibrar cada motor hasta que el dron de "saltitos". Luego activamos control.
+  //Esto tiene que ver con la inexactitud del montaje (motores torcidos, pesos mal repartidos, etc). AsÃ­ el control no tiene que compensar tanto.
+  
+  float m1_call=52;
+  float m2_call=4;
+  float m3_call=-52;
+  float m4_call=-4;
+  
+  /*
+  float m1_call=0;
+  float m2_call=0;
+  float m3_call=0;
+  float m4_call=0;
+  */
+  // Mezcla (X-frame)
+    
+  float m1 = motorBase - pitch_corr + roll_corr - yaw_corr + m1_call;   // delantero izq
+  float m2 = motorBase - pitch_corr - roll_corr + yaw_corr + m2_call;   // delantero der
+  float m3 = motorBase + pitch_corr - roll_corr - yaw_corr + m3_call;   // trasero der
+  float m4 = motorBase + pitch_corr + roll_corr + yaw_corr + m4_call;   // trasero izq
+
+  // --- DesaturaciÃ³n por colectivo ---
+  //Si algÃºn motor llega al tope de potencia y necesitamos mÃ¡s, esta funciÃ³n baja los demÃ¡s en vez
+  //de subir el que ya no puede
+  
+  float maxOut = fmaxf(fmaxf(m1, m2), fmaxf(m3, m4));
+  if (maxOut > PWM_MAX) {
+    float shiftDown = maxOut - PWM_MAX;
+    m1 -= shiftDown; m2 -= shiftDown; m3 -= shiftDown; m4 -= shiftDown;
+  }
+
+  float minOut = fminf(fminf(m1, m2), fminf(m3, m4));
+  if (minOut < minClamp) {
+    float shiftUp = minClamp - minOut;
+    m1 += shiftUp; m2 += shiftUp; m3 += shiftUp; m4 += shiftUp;
+    maxOut = fmaxf(fmaxf(m1, m2), fmaxf(m3, m4));
+    if (maxOut > PWM_MAX) {
+      float shiftDown = maxOut - PWM_MAX;
+      m1 -= shiftDown; m2 -= shiftDown; m3 -= shiftDown; m4 -= shiftDown;
+    }
+  }
+
+  // Clamp y aplicar
+  int out1 = constrain((int)lroundf(m1), 0, PWM_MAX);
+  int out2 = constrain((int)lroundf(m2), 0, PWM_MAX);
+  int out3 = constrain((int)lroundf(m3), 0, PWM_MAX);
+  int out4 = constrain((int)lroundf(m4), 0, PWM_MAX);
+
+  if (ActivarMotor) {
+    setMotor(CH_M1, out1);
+    setMotor(CH_M2, out2);
+    setMotor(CH_M3, out3);
+    setMotor(CH_M4, out4);
+  } else {
+    setMotor(CH_M1, 0);
+    setMotor(CH_M2, 0);
+    setMotor(CH_M3, 0);
+    setMotor(CH_M4, 0);
+  }
+  
+  // Datos de potencia, Ã¡ngulos, distancia, etc
+   Serial.printf("Base:%3d | m1:%3d  m2:%3d  m3:%3d  m4:%3d | pitch:%5.1f  roll:%5.1f  yaw:%5.1f  gyro:%5.1f| | Manpitch:%5.1f Manroll:%5.1f Manyaw:%5.1f | dist=%3d mm\n",
+                 motorBase, out1, out2, out3, out4, pitch_f, roll_f, yaw_f, gyroZ_corr, manualPitchCmd, manualRollCmd, manualYawCmd, dist_mm);
+   
+   if (motorBase>0)
+   {
+   telemetry.roll_f = roll_f;
+   telemetry.pitch_f = pitch_f;
+   telemetry.motorBase = motorBase;
+   telemetry.out1 = out1;
+   telemetry.out2 = out2;
+   telemetry.out3 = out3;
+   telemetry.out4 = out4;
+   telemetry.manPitchCmd = manualPitchCmd;
+   telemetry.manRollCmd = manualRollCmd;
+   telemetry.manYawCmd = manualYawCmd;
+   telemetry.yaw_f = yaw_f;
+   telemetry.gyroZ_corr = gyroZ_corr;
+   telemetry.distance_mm = dist_mm;
+   esp_now_send(broadcastAddress, (uint8_t*)&telemetry, sizeof(telemetry));
+   }
+  delay(1);
+}
